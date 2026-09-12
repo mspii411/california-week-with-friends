@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private us-east-2 static-site S3 origin — CloudFront is the only public delivery path.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: private S3 origin <- CloudFront OAC
+    must: [no public S3 access]
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: private versioned site origin; CDN-authenticated reads only
+        must: [all public-access blocks remain enabled, retain content on stack deletion]
+        mutable: review-required
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: {Status: Enabled}
+Outputs:
+  SiteBucketName:
+    Description: Private S3 origin bucket name.
+    Value: !Ref SiteBucket
+  SiteBucketArn:
+    Description: Private S3 origin bucket ARN.
+    Value: !GetAtt SiteBucket.Arn
+  SiteBucketRegionalDomainName:
+    Description: Regional S3 origin hostname.
+    Value: !GetAtt SiteBucket.RegionalDomainName
+

@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: $5 monthly AWS cost budget with actual and forecast email alerts — alert-only, with no automatic service changes.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+Parameters:
+  AlertEmail:
+    Type: String
+    AllowedPattern: '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$'
+Resources:
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: alert quickly on website cost while never disrupting the itinerary
+        must: [monthly limit USD 5, monitoring only]
+        mutable: review-required
+    Properties:
+      Budget:
+        BudgetName: CaliforniaWeekWithFriends-Monthly-5USD
+        BudgetLimit: {Amount: '5', Unit: USD}
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+Outputs:
+  BudgetName:
+    Description: Monthly $5 monitoring budget name.
+    Value: !Ref MonthlyBudget

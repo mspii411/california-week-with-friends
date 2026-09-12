@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Custom-domain CloudFront delivery with OAC, ACM, Route 53, www canonicalization, and the CloudFront Free pricing plan when eligible.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: Route53 -> root CloudFront (OAC -> private S3); www CloudFront -> 301 root
+    must:
+      - ACM certificate remains in us-east-1 for CloudFront
+      - root distribution and WAF stay paired for Free plan
+Parameters:
+  SiteBucketName:
+    Type: String
+  SiteBucketArn:
+    Type: String
+  SiteBucketRegionalDomainName:
+    Type: String
+  DomainName:
+    Type: String
+    Default: californiaweekwithfriends.com
+    AllowedPattern: '^[a-z0-9.-]+$'
+Resources:
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: authoritative DNS zone for apex and www records
+        must: [registrar must delegate to these assigned name servers]
+        mutable: review-required
+    Properties:
+      Name: !Ref DomainName
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CloudFront-compatible TLS certificate validated through the managed zone
+        must: [certificate stays in us-east-1, covers apex and www]
+        mutable: review-required
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames: [!Sub 'www.${DomainName}']
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZone
+        - DomainName: !Sub 'www.${DomainName}'
+          HostedZoneId: !Ref HostedZone
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: required paired resource for the CloudFront Free pricing plan
+        must: [scope remains CLOUDFRONT, keep associated with root distribution]
+        mutable: review-required
+    Properties:
+      Scope: CLOUDFRONT
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: californiaWeekRoot
+        SampledRequestsEnabled: true
+      Rules: []
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: signs S3 origin requests so bucket never needs public access
+        must: [origin type remains s3, signing always enabled]
+        mutable: review-required
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  RootDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: primary HTTPS CDN for apex, protected by OAC and paired WAF
+        must: [HTTPS redirect, OAC origin, ACM certificate, WebACL association]
+        mutable: review-required
+    Properties:
+      DistributionConfig:
+        Aliases: [!Ref DomainName]
+        Comment: California Week with Friends root site
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          TargetOriginId: site-s3
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: site-s3
+            DomainName: !Ref SiteBucketRegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {}
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+        WebACLId: !GetAtt WebAcl.Arn
+  WwwRedirectFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-www-redirect'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Redirect www to the canonical apex domain.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        async function handler(event) {
+          const request = event.request;
+          return {
+            statusCode: 301,
+            statusDescription: 'Moved Permanently',
+            headers: { location: { value: 'https://${DomainName}' + request.uri + (request.querystring ? '?' + request.querystring : '') } }
+          };
+        }
+  WwwRedirectDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: accepts HTTPS www requests solely to issue permanent canonical redirect
+        must: [www must redirect to apex, OAC origin access remains private]
+        mutable: review-required
+    Properties:
+      DistributionConfig:
+        Aliases: [!Sub 'www.${DomainName}']
+        Comment: California Week with Friends www canonical redirect
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt WwwRedirectFunction.FunctionARN
+          TargetOriginId: site-s3
+          ViewerProtocolPolicy: redirect-to-https
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: site-s3
+            DomainName: !Ref SiteBucketRegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {}
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: confines origin reads to precisely the two CloudFront distributions
+        must: [deny insecure transport, never grant public principal]
+        mutable: review-required
+    Properties:
+      Bucket: !Ref SiteBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucketArn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn:
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${RootDistribution}'
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WwwRedirectDistribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!Ref SiteBucketArn, !Sub '${SiteBucketArn}/*']
+            Condition:
+              Bool: {aws:SecureTransport: false}
+  RootAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt RootDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  RootIpv6AliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt RootDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  WwwAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub 'www.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WwwRedirectDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  WwwIpv6AliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub 'www.${DomainName}'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt WwwRedirectDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  FreePricingPlan:
+    Type: AWS::PricingPlanManager::Subscription
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: attaches eligible root delivery, WAF, and DNS resources to $0/month plan
+        must: [tier must remain FREE, only root distribution belongs to plan]
+        mutable: review-required
+    Properties:
+      PlanFamily: CloudFront
+      PlanTier: FREE
+      UsageLevel: DEFAULT
+      ResourceArns:
+        - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${RootDistribution}'
+        - !GetAtt WebAcl.Arn
+        - !Sub 'arn:${AWS::Partition}:route53:::hostedzone/${HostedZone}'
+Outputs:
+  HostedZoneId:
+    Description: Route 53 hosted zone ID.
+    Value: !Ref HostedZone
+  NameServers:
+    Description: Delegate the domain at its registrar to these name servers.
+    Value: !Join [', ', !GetAtt HostedZone.NameServers]
+  CertificateArn:
+    Description: ACM certificate ARN in us-east-1.
+    Value: !Ref Certificate
+  CertificateStatus:
+    Description: ACM certificate status.
+    Value: !GetAtt Certificate.Status
+  RootDistributionId:
+    Description: Production CloudFront distribution ID.
+    Value: !Ref RootDistribution
+  RootDistributionDomainName:
+    Description: CloudFront fallback URL hostname.
+    Value: !GetAtt RootDistribution.DomainName
+  WwwRedirectDistributionId:
+    Description: CloudFront distribution used only for www redirect.
+    Value: !Ref WwwRedirectDistribution
+  FreePricingPlanStatus:
+    Description: Free CloudFront pricing plan subscription status.
+    Value: !GetAtt FreePricingPlan.Status

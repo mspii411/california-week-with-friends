@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Least-privilege GitHub OIDC deployment role — can synchronize only this site bucket and invalidate only its production CDN.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: GitHub Actions OIDC -> scoped S3 + CloudFront deployment role
+    must: [short-lived GitHub OIDC credentials only, trust only main branch]
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: mspii411/california-week-with-friends
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  SiteBucketName:
+    Type: String
+  SiteBucketArn:
+    Type: String
+  CloudFrontDistributionId:
+    Type: String
+    AllowedPattern: '^[A-Z0-9]+$'
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: GitHub runners exchange signed OIDC tokens for temporary AWS credentials
+        must: [audience is sts.amazonaws.com]
+        mutable: review-required
+    Properties:
+      ClientIdList: [sts.amazonaws.com]
+      Url: https://token.actions.githubusercontent.com
+  GitHubDeploymentRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CI can update only this origin and invalidate only this distribution
+        must: [trust only main branch of supplied repository, no permanent AWS keys]
+        mutable: review-required
+    Properties:
+      Description: Deploys the California itinerary through GitHub Actions OIDC.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: !Ref GitHubOidcProvider}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubRepository}:ref:refs/heads/main'
+      Policies:
+        - PolicyName: DeployStaticSite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListDeploymentBucket
+                Effect: Allow
+                Action: [s3:GetBucketLocation, s3:ListBucket]
+                Resource: !Ref SiteBucketArn
+              - Sid: SynchronizeSiteObjects
+                Effect: Allow
+                Action: [s3:DeleteObject, s3:GetObject, s3:PutObject]
+                Resource: !Sub '${SiteBucketArn}/*'
+              - Sid: InvalidateOnlyProductionDistribution
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistributionId}'
+Outputs:
+  GitHubDeploymentRoleArn:
+    Description: OIDC role assumed by the GitHub deployment workflow.
+    Value: !GetAtt GitHubDeploymentRole.Arn
