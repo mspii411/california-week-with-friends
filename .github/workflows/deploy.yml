@@ -36,10 +36,11 @@ jobs:
           --no-fail-on-empty-changeset
           --capabilities CAPABILITY_IAM
       - name: Write public preferences API configuration
-        run: >-
-          printf "window.GUEST_PREFERENCES_API_URL = '%s';\\n"
-          "$(aws cloudformation describe-stacks --stack-name california-week-preferences --region us-east-2 --query 'Stacks[0].Outputs[?OutputKey==\`PreferencesApiEndpoint\`].OutputValue' --output text)"
-          > site/preferences-config.js
+        run: |
+          set -euo pipefail
+          api_url="$(aws cloudformation describe-stacks --stack-name california-week-preferences --region us-east-2 --query "Stacks[0].Outputs[?OutputKey=='PreferencesApiEndpoint'].OutputValue" --output text)"
+          test -n "$api_url"
+          printf "window.GUEST_PREFERENCES_API_URL = '%s';\\n" "$api_url" > site/preferences-config.js
       - name: Synchronize immutable assets
         run: >-
           aws s3 sync site/ s3://california-week-with-friends-778977181879/ --delete
