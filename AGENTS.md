@@ -1,5 +1,7 @@
 # California Week itinerary workflow
 
+“Publish latest” means: take the newest itinerary changes, commit them to this GitHub repository, push `main`, wait for the AWS deployment to finish, and verify https://californiaweekwithfriends.com. Do not ask the user to restate changes that are already present in the current conversation.
+
 When the user requests an itinerary change in this repository:
 
 1. Pull the latest `main` branch before editing.
