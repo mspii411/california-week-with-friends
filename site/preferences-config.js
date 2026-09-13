@@ -1,0 +1,1 @@
+window.GUEST_PREFERENCES_API_URL = '';

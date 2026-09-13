@@ -19,3 +19,14 @@ Infrastructure is split by AWS scope:
 - `infrastructure/github-oidc.yaml` — GitHub OIDC deployment role (after the production distribution exists).
 - `infrastructure/edge.yaml` — us-east-1 ACM, Route 53, CloudFront, WAF, and optional free pricing plan.
 - `infrastructure/budget.yaml` — global AWS Budget (deploy in us-east-1 with a notification email parameter).
+- `infrastructure/preferences.yaml` — us-east-2 POST-only guest-preferences HTTP API, Lambda, and encrypted DynamoDB storage.
+
+## Guest preference responses
+
+Guest responses are retained in the private `california-week-preferences-PreferencesTable-*` DynamoDB table until shortly after the trip. They are not available through the public site or API. With authenticated AWS access, retrieve responses using:
+
+```sh
+aws dynamodb scan --table-name "$(aws cloudformation describe-stacks --stack-name california-week-preferences --region us-east-2 --query 'Stacks[0].Outputs[?OutputKey==`PreferencesTableName`].OutputValue' --output text)" --region us-east-2
+```
+
+Treat this output as private guest information; do not copy it into GitHub, issues, or logs.

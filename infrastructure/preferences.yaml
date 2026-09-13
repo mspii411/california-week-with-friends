@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private guest-preference storage with a public POST-only HTTP API for the California Week itinerary.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: Browser -> HTTP API POST route -> Lambda validation -> encrypted DynamoDB submissions table
+    must:
+      - submissions are never readable through the public API
+      - no request bodies or preference content are written to CloudWatch logs
+      - table records expire shortly after the trip through DynamoDB TTL
+Parameters:
+  ProductionOrigin:
+    Type: String
+    Default: https://californiaweekwithfriends.com
+    AllowedPattern: '^https://[A-Za-z0-9.-]+$'
+Resources:
+  PreferencesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores submitted guest preferences privately until after the October 2026 trip.
+        must: [PAY_PER_REQUEST, encryption enabled, point-in-time recovery enabled, TTL on expiresAt, never grant public access]
+        mutable: change-with-constraints
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: submissionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: submissionId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+  PreferencesLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Retains operational errors briefly without application request-body logging.
+        must: [14-day retention, handler must not log submitted answers]
+        mutable: change-with-constraints
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-submit'
+      RetentionInDays: 14
+  PreferencesFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets the submission Lambda write one validated record and minimal operational logs.
+        must: [only dynamodb:PutItem on this table, no read permissions]
+        mutable: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteValidatedPreferences
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt PreferencesTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${PreferencesLogGroup.Arn}:*'
+  PreferencesFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Validates small, structured POST payloads server-side and writes a generated-ID record.
+        must: [POST only via API route, no request body logs, generic errors only, 24 KB payload maximum]
+        mutable: change-with-constraints
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-submit'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt PreferencesFunctionRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PreferencesTable
+          EXPIRES_AT: '1801440000'
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+          const { randomUUID } = require('crypto');
+          const db = new DynamoDBClient({});
+          const text = (value, max) => typeof value === 'string' && value.length <= max;
+          const oneOf = (value, choices) => value === undefined || choices.includes(value);
+          const listOf = (value, choices, max = 8) => value === undefined || (Array.isArray(value) && value.length <= max && value.every(item => typeof item === 'string' && choices.includes(item)));
+          const reply = (statusCode, body) => ({ statusCode, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify(body) });
+          exports.handler = async event => {
+            if (event.requestContext?.http?.method !== 'POST') return reply(405, { message: 'Method not allowed' });
+            if (!event.body || Buffer.byteLength(event.body, 'utf8') > 24576) return reply(400, { message: 'Please submit a shorter response.' });
+            let input;
+            try { input = JSON.parse(event.body); } catch { return reply(400, { message: 'Please review your response and try again.' }); }
+            if (!input || typeof input !== 'object' || Array.isArray(input) || !text(input.name, 120) || !input.name.trim()) return reply(400, { message: 'Please enter your name.' });
+            const strings = ['foodOther','allergyDetails','dislikes','enjoys','morningDrink','snacks','activityNotes','accommodationDetails','emergencyItemDetails','anythingElse'];
+            if (!strings.every(key => text(input[key] || '', 1500))) return reply(400, { message: 'One of your responses is too long.' });
+            const valid = oneOf(input.allergy, ['No','Yes']) && oneOf(input.adventurousness, ['I’ll eat almost anything','Pretty flexible','I prefer familiar foods','I’m fairly selective']) && oneOf(input.breakfast, ['Coffee and something light','Traditional breakfast','Healthy/light breakfast','Usually skip breakfast','Other']) && oneOf(input.alcohol, ['Yes','Sometimes','No']) && oneOf(input.nonAlcoholic, ['Yes','No preference']) && oneOf(input.walking, ['No problem','Fine, but I appreciate breaks','I may need shorter walks or more frequent breaks']) && oneOf(input.stairs, ['Yes','Usually, but I may need extra time','I’d prefer to avoid a lot of stairs']) && oneOf(input.motionSick, ['No','Sometimes','Yes']) && oneOf(input.accommodations, ['Nothing we need to know','Yes']) && oneOf(input.emergencyItem, ['No','Yes']) && listOf(input.foodRestrictions, ['No restrictions','Vegetarian','Vegan','Gluten-free','Dairy-free','Other']) && listOf(input.drinks, ['Red wine','White wine','Rosé','Sparkling wine','Cocktails','Beer','No real preference']);
+            if (!valid) return reply(400, { message: 'Please review your selections and try again.' });
+            const submittedAt = new Date().toISOString(), submissionId = randomUUID();
+            const record = { submissionId, submittedAt, expiresAt: Number(process.env.EXPIRES_AT), name: input.name.trim(), food: { restrictions: input.foodRestrictions || [], other: input.foodOther || '', allergy: input.allergy, allergyDetails: input.allergy === 'Yes' ? input.allergyDetails || '' : '', dislikes: input.dislikes || '', enjoys: input.enjoys || '', adventurousness: input.adventurousness, breakfast: input.breakfast, morningDrink: input.morningDrink || '', snacks: input.snacks || '' }, drinks: { alcohol: input.alcohol, preferences: input.drinks || [], nonAlcoholic: input.nonAlcoholic }, activities: { walking: input.walking, stairs: input.stairs, motionSick: input.motionSick, notes: input.activityNotes || '' }, accommodations: { awareness: input.accommodations, details: input.accommodations === 'Yes' ? input.accommodationDetails || '' : '', emergencyItem: input.emergencyItem, emergencyItemDetails: input.emergencyItem === 'Yes' ? input.emergencyItemDetails || '' : '' }, anythingElse: input.anythingElse || '' };
+            try { await db.send(new PutItemCommand({ TableName: process.env.TABLE_NAME, Item: { submissionId: { S: record.submissionId }, submittedAt: { S: record.submittedAt }, expiresAt: { N: String(record.expiresAt) }, name: { S: record.name }, food: { S: JSON.stringify(record.food) }, drinks: { S: JSON.stringify(record.drinks) }, activities: { S: JSON.stringify(record.activities) }, accommodations: { S: JSON.stringify(record.accommodations) }, anythingElse: { S: record.anythingElse } } })); }
+            catch { return reply(500, { message: 'We could not save your preferences. Please try again.' }); }
+            return reply(201, { submissionId });
+          };
+  PreferencesApi:
+    Type: AWS::ApiGatewayV2::Api
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Publicly accepts only preference submissions from the canonical production site.
+        must: [CORS only allows production origin, no public read route]
+        mutable: change-with-constraints
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref ProductionOrigin]
+        AllowMethods: [POST]
+        AllowHeaders: [content-type]
+        MaxAge: 600
+  PreferencesIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PreferencesApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PreferencesFunction.Arn
+      PayloadFormatVersion: '2.0'
+  PreferencesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PreferencesApi
+      RouteKey: 'POST /preferences'
+      AuthorizationType: NONE
+      Target: !Join ['/', ['integrations', !Ref PreferencesIntegration]]
+  PreferencesStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PreferencesApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+  PreferencesInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreferencesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${PreferencesApi}/*/POST/preferences'
+Outputs:
+  PreferencesApiEndpoint:
+    Description: POST-only guest preference submission endpoint.
+    Value: !Sub 'https://${PreferencesApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/preferences'
+  PreferencesTableName:
+    Description: Private DynamoDB table containing submitted guest preferences.
+    Value: !Ref PreferencesTable
+  PreferencesFunctionName:
+    Description: Lambda function accepting validated preference submissions.
+    Value: !Ref PreferencesFunction
