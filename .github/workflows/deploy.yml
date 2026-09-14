@@ -41,6 +41,10 @@ jobs:
           api_url="$(aws cloudformation describe-stacks --stack-name california-week-preferences --region us-east-2 --query "Stacks[0].Outputs[?OutputKey=='PreferencesApiEndpoint'].OutputValue" --output text)"
           test -n "$api_url"
           printf "window.GUEST_PREFERENCES_API_URL = '%s';\\n" "$api_url" > site/preferences-config.js
+      - name: Stamp the deployed build version
+        run: |
+          build_version="$(git rev-parse --short HEAD)"
+          find site -name '*.html' -exec sed -i "s/__BUILD_VERSION__/$build_version/g" {} +
       - name: Synchronize immutable assets
         run: >-
           aws s3 sync site/ s3://california-week-with-friends-778977181879/ --delete
