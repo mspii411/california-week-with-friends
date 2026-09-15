@@ -59,7 +59,51 @@ Resources:
         CloudWatchMetricsEnabled: true
         MetricName: californiaWeekRoot
         SampledRequestsEnabled: true
-      Rules: []
+      Rules:
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 0
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: amazonIpReputation
+            SampledRequestsEnabled: true
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: commonRuleSet
+            SampledRequestsEnabled: true
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: knownBadInputs
+            SampledRequestsEnabled: true
+        - Name: RateLimitPerIp
+          Priority: 3
+          Action: {Block: {}}
+          Statement:
+            RateBasedStatement:
+              AggregateKeyType: IP
+              Limit: 2000
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: rateLimitPerIp
+            SampledRequestsEnabled: true
   OriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
     Metadata:
