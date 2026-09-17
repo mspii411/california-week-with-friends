@@ -6,6 +6,7 @@ on:
     paths:
       - 'site/**'
       - 'infrastructure/preferences.yaml'
+      - 'infrastructure/analytics.yaml'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
@@ -35,16 +36,34 @@ jobs:
           --region us-east-2
           --no-fail-on-empty-changeset
           --capabilities CAPABILITY_IAM
+      - name: Deploy first-party analytics infrastructure
+        run: >-
+          aws cloudformation deploy
+          --stack-name california-week-analytics
+          --template-file infrastructure/analytics.yaml
+          --region us-east-2
+          --no-fail-on-empty-changeset
+          --capabilities CAPABILITY_IAM
       - name: Write public preferences API configuration
         run: |
           set -euo pipefail
           api_url="$(aws cloudformation describe-stacks --stack-name california-week-preferences --region us-east-2 --query "Stacks[0].Outputs[?OutputKey=='PreferencesApiEndpoint'].OutputValue" --output text)"
           test -n "$api_url"
           printf "window.GUEST_PREFERENCES_API_URL = '%s';\\n" "$api_url" > site/preferences-config.js
+      - name: Write public analytics configuration
+        run: |
+          set -euo pipefail
+          analytics_url="$(aws cloudformation describe-stacks --stack-name california-week-analytics --region us-east-2 --query "Stacks[0].Outputs[?OutputKey=='AnalyticsEndpoint'].OutputValue" --output text)"
+          test -n "$analytics_url"
+          printf "window.CALIFORNIA_WEEK_ANALYTICS = { endpoint: '%s' };\\n" "$analytics_url" > site/analytics-config.js
       - name: Stamp the deployed build version
         run: |
           build_version="$(git rev-parse --short HEAD)"
           find site -name '*.html' -exec sed -i "s/__BUILD_VERSION__/$build_version/g" {} +
+      - name: Enable analytics on public pages
+        run: |
+          find site -name '*.html' -exec sed -i 's#</body>#<script src="analytics-config.js"></script><script src="analytics.js"></script></body>#' {} +
+          printf '<script src="analytics-config.js"></script><script src="analytics.js"></script></body></html>\\n' >> site/index.html
       - name: Synchronize immutable assets
         run: >-
           aws s3 sync site/ s3://california-week-with-friends-778977181879/ --delete
@@ -59,6 +78,11 @@ jobs:
       - name: Upload preferences API configuration
         run: >-
           aws s3 cp site/preferences-config.js s3://california-week-with-friends-778977181879/preferences-config.js
+          --cache-control 'no-cache,no-store,must-revalidate'
+          --content-type 'application/javascript; charset=utf-8'
+      - name: Upload analytics configuration
+        run: >-
+          aws s3 cp site/analytics-config.js s3://california-week-with-friends-778977181879/analytics-config.js
           --cache-control 'no-cache,no-store,must-revalidate'
           --content-type 'application/javascript; charset=utf-8'
       - name: Invalidate CloudFront

@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Privacy-conscious, first-party traffic analytics for California Week.
+Parameters:
+  ProductionOrigin:
+    Type: String
+    Default: https://californiaweekwithfriends.com
+    AllowedPattern: '^https://[A-Za-z0-9.-]+$'
+Resources:
+  AnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-track'
+      RetentionInDays: 90
+  AnalyticsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteAnalyticsEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub '${AnalyticsLogGroup.Arn}:*'
+  AnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-track'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt AnalyticsFunctionRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          ORIGIN: !Ref ProductionOrigin
+      Code:
+        ZipFile: |
+          const origin = process.env.ORIGIN;
+          const reply = statusCode => ({ statusCode, headers: { 'access-control-allow-origin': origin, 'cache-control': 'no-store' }, body: '' });
+          const validId = value => typeof value === 'string' && /^[a-z0-9-]{8,64}$/i.test(value);
+          const validPage = value => typeof value === 'string' && /^\/[a-zA-Z0-9/_-]{0,199}$/.test(value);
+          const validReferrer = value => {
+            if (value === '') return true;
+            try { const parsed = new URL(value); return ['http:', 'https:'].includes(parsed.protocol) && parsed.origin === value && value.length <= 200; }
+            catch { return false; }
+          };
+          exports.handler = async event => {
+            if (event.requestContext?.http?.method !== 'POST') return reply(405);
+            if (!event.body || Buffer.byteLength(event.body, 'utf8') > 2048) return reply(400);
+            let input;
+            try { input = JSON.parse(event.body); } catch { return reply(400); }
+            const duration = input.durationMs;
+            const valid = input && typeof input === 'object' && ['pageview', 'engagement'].includes(input.eventType) && validId(input.visitorId) && validPage(input.page) && validReferrer(input.referrer || '') && (input.eventType === 'pageview' || (Number.isInteger(duration) && duration >= 0 && duration <= 21600000));
+            if (!valid) return reply(400);
+            // Deliberately omits IPs, user agents, query strings, and survey content.
+            console.log(JSON.stringify({ eventType: input.eventType, visitorId: input.visitorId, page: input.page, referrer: input.referrer || '', durationMs: input.eventType === 'engagement' ? duration : undefined, recordedAt: new Date().toISOString() }));
+            return reply(204);
+          };
+  AnalyticsApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref ProductionOrigin]
+        AllowMethods: [POST]
+        AllowHeaders: [content-type]
+        MaxAge: 600
+  AnalyticsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref AnalyticsApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AnalyticsFunction.Arn
+      PayloadFormatVersion: '2.0'
+  AnalyticsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AnalyticsApi
+      RouteKey: 'POST /event'
+      AuthorizationType: NONE
+      Target: !Join ['/', ['integrations', !Ref AnalyticsIntegration]]
+  AnalyticsStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref AnalyticsApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+  AnalyticsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AnalyticsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AnalyticsApi}/*/POST/event'
+  AnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"log","x":0,"y":0,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Daily visitors and page views","view":"table","query":"SOURCE '${AnalyticsLogGroup}' | filter eventType = \"pageview\" | stats count(*) as PageViews, count_distinct(visitorId) as UniqueVisitors by bin(1d) | sort @timestamp desc"}},
+          {"type":"log","x":12,"y":0,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Most visited pages","view":"table","query":"SOURCE '${AnalyticsLogGroup}' | filter eventType = \"pageview\" | stats count(*) as PageViews by page | sort PageViews desc"}},
+          {"type":"log","x":0,"y":6,"width":24,"height":6,"properties":{"region":"${AWS::Region}","title":"Time spent by page (seconds)","view":"table","query":"SOURCE '${AnalyticsLogGroup}' | filter eventType = \"engagement\" | stats round(avg(durationMs) / 1000, 1) as AverageSeconds, round(pct(durationMs, 90) / 1000, 1) as P90Seconds, count(*) as CompletedVisits by page | sort AverageSeconds desc"}}
+        ]}
+Outputs:
+  AnalyticsEndpoint:
+    Description: Browser endpoint for anonymous first-party analytics events.
+    Value: !Sub 'https://${AnalyticsApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/event'
+  AnalyticsDashboardName:
+    Description: CloudWatch dashboard with traffic and engagement reports.
+    Value: !Ref AnalyticsDashboard
